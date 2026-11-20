@@ -22,6 +22,7 @@ const extractBearer = ExtractJwt.fromAuthHeaderAsBearerToken();
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     private readonly jwtService: JwtService,
+    @Optional() private readonly refreshTokenStore?: RefreshTokenStoreService,
     @Optional() @Inject(REDIS_CLIENT) private readonly redis?: Redis | null,
   ) {
     super({
@@ -36,6 +37,23 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
+  async validate(payload: JwtPayload) {
+    // #846: a malformed wallet claim is an authentication failure (401), not a server error.
+    if (typeof payload.address !== 'string' || !StrKey.isValidEd25519PublicKey(payload.address)) {
+      throw new UnauthorizedException('Invalid wallet address in token');
+    }
+
+    // #847: an access token superseded by a refresh of the same session is no longer valid.
+    if (
+      payload.sid &&
+      payload.jti &&
+      this.refreshTokenStore &&
+      !(await this.refreshTokenStore.isActiveAccessJti(payload.sid, payload.jti))
+    ) {
+      throw new UnauthorizedException('Token has been superseded by a refresh');
+    }
+
+    return { address: payload.address, sub: payload.sub };
   async validate(request: any, payload: JwtPayload) {
     const token = extractBearer(request);
     if (token && (await isTokenRevoked(this.redis, token))) {
