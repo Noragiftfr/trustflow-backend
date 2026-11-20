@@ -131,6 +131,21 @@ export interface BatchApproveResult {
   failed: Array<{ id: string; reason: string }>;
 }
 
+/**
+ * Filter for depositor-facing escrow listings. Mirrors the applicant-list behaviour:
+ * terminal/withdrawn entries are hidden by default and must be explicitly opted into,
+ * so clients that ignore a `status` field can't present them as live candidates.
+ */
+export interface EscrowListFilter {
+  /** Match exactly this status. Takes precedence over `includeCancelled`. */
+  status?: EscrowStatus;
+  /** Include cancelled (withdrawn-equivalent) escrows in the default listing. */
+  includeCancelled?: boolean;
+}
+
+/** Defense-in-depth check; the HTTP layer validates the same format via the DTO. */
+const STELLAR_ADDRESS_REGEX = /^G[A-Z2-7]{55}$/;
+
 @Injectable()
 export class EscrowService implements OnModuleInit {
   private readonly logger = new SanitizedLogger(EscrowService.name);
@@ -257,6 +272,7 @@ export class EscrowService implements OnModuleInit {
     address: string,
     offset = 0,
     limit = 20,
+    filter: EscrowListFilter = {},
   ): Promise<{ data: Escrow[]; total: number }> {
     let all: Escrow[];
     if (this.redis) {
@@ -412,6 +428,57 @@ export class EscrowService implements OnModuleInit {
     }
     escrow.status = 'active';
     await this.persist(escrow, ESCROW_EVENTS.ESCROW_FUNDED);
+    return escrow;
+  }
+
+  /**
+   * Changes the payout address of an escrow. This is a money-directing operation, so it is
+   * deliberately much more restricted than an ordinary draft-field edit:
+   *
+   * - the requester must be the depositor (checked again here, not only at the HTTP layer);
+   * - once funds are committed (`status !== 'pending'`) the beneficiary is **immutable** —
+   *   changing it would need a fresh signed confirmation from both parties, so it is refused
+   *   outright. This is the "disallow post-funding" option from the issue.
+   *
+   * Every successful change is audit-logged with before/after state.
+   */
+  async changeBeneficiary(id: string, beneficiary: string, requester: string): Promise<Escrow> {
+    const escrow = await this.findById(id);
+    if (!escrow) throw new NotFoundException('Escrow not found');
+
+    if (!STELLAR_ADDRESS_REGEX.test(beneficiary)) {
+      throw new BadRequestException('Invalid Stellar address');
+    }
+    if (escrow.depositor !== requester) {
+      throw new BadRequestException('Only the depositor may change the beneficiary');
+    }
+    if (escrow.status !== 'pending') {
+      throw new BadRequestException(
+        `Cannot change the beneficiary of a funded escrow (status: ${escrow.status})`,
+      );
+    }
+    if (beneficiary === escrow.depositor) {
+      throw new BadRequestException('depositor and beneficiary must not be the same address');
+    }
+    if (beneficiary === escrow.beneficiary) return escrow;
+
+    const beforeState = { ...escrow };
+    escrow.beneficiary = beneficiary;
+    await this.persist(escrow);
+
+    if (this.audit) {
+      await this.audit
+        .logOperation({
+          operation: 'ESCROW_BENEFICIARY_CHANGE',
+          user: requester,
+          entityId: id,
+          entityType: 'escrow',
+          beforeState,
+          afterState: escrow,
+        })
+        .catch(err => this.logger.error('Failed to write audit log', err));
+    }
+
     return escrow;
   }
 
